@@ -1,0 +1,20 @@
+<?php
+
+namespace App\AI\Chunking;
+
+class DocumentChunk
+{
+    public function __construct(
+        public readonly int $index,
+        public readonly int $total,
+        public readonly string $content,
+        public readonly bool $containsHeader,
+        public readonly bool $isLast,
+        public readonly ?string $headerContext = null,
+        public readonly ?array $sourceMetadata = null,
+        public readonly ?string $sheetName = null,
+        public readonly bool $isFirstSheetChunk = false,
+        public readonly ?string $statementHint = null,
+        public readonly array $periodContext = [],
+    ) {}
+}
