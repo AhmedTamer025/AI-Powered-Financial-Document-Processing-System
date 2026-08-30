@@ -1,0 +1,124 @@
+<?php
+
+namespace App\AI\Builders;
+
+use App\AI\Chunking\DocumentChunk;
+use App\AI\DTOS\RawDocument;
+
+class BankStatementPromptBuilder
+{
+    public static function build(
+        RawDocument $document,
+        DocumentChunk $chunk
+    ): string {
+
+        $warnings = empty($document->warnings)
+            ? 'None'
+            : implode(PHP_EOL, $document->warnings);
+
+        $header = $chunk->containsHeader ? 'YES' : 'NO';
+        $last = $chunk->isLast ? 'YES' : 'NO';
+
+        return <<<PROMPT
+You are an expert bank statement normalization engine.
+
+The OCR has already been completed.
+
+This document has been split into multiple chunks.
+
+Current chunk:
+- Chunk {$chunk->index} of {$chunk->total}
+- Contains Header: {$header}
+- Last Chunk: {$last}
+
+IMPORTANT
+
+This is ONE bank statement.
+
+Never create multiple statements.
+
+If this chunk contains the document header:
+
+Extract
+
+- bank_name
+- branch
+- account_number
+- iban
+- currency
+- account_holder
+- opening_balance
+- statement_period
+
+Otherwise
+
+Do NOT invent them.
+
+If they do not appear,
+return null.
+
+Always extract ALL transactions appearing inside THIS chunk.
+
+For EVERY transaction:
+
+- transaction_type is REQUIRED.
+- Never omit transaction_type.
+- If the statement already contains a transaction type column, copy it exactly.
+- Otherwise classify the transaction using its description.
+- If the type cannot be determined, return "other".
+- Every transaction must include a source object describing where it came from.
+- For PDF/OCR input, page is required whenever a nearby PAGE n marker exists.
+- Use the nearest PAGE n marker before the transaction, not the chunk number.
+- For table rows, preserve page, row, table, and label when available.
+- For Excel, use sheet, row, and cell.
+- If page is not present in the current chunk, return it as null; post-processing will resolve it from the original OCR.
+
+Allowed values only:
+
+- deposit
+- withdrawal
+- transfer
+- card_payment
+- atm_withdrawal
+- cheque
+- bank_fee
+- salary
+- interest
+- refund
+- direct_debit
+- standing_order
+- international_transfer
+- cash
+- other
+
+Never invent information that is not supported by the transaction description.
+
+Never summarize.
+
+Never skip rows.
+
+Never calculate balances.
+
+Never infer values.
+
+Ignore page headers.
+
+Ignore page numbers.
+
+Return ONLY valid JSON.
+
+Warnings
+
+{$warnings}
+
+
+Header Context
+
+{$chunk->headerContext}
+
+Current Chunk
+
+{$chunk->content}
+PROMPT;
+    }
+}
