@@ -1,0 +1,92 @@
+<?php
+
+namespace App\Enums;
+
+enum BankStatementTransaction: int
+{
+    case Other = 0;
+    case Deposit = 1;
+    case Withdrawal = 2;
+    case Transfer = 3;
+    case CardPayment = 4;
+    case AtmWithdrawal = 5;
+    case Cheque = 6;
+    case BankFee = 7;
+    case Salary = 8;
+    case Interest = 9;
+    case Refund = 10;
+    case DirectDebit = 11;
+    case StandingOrder = 12;
+    case InternationalTransfer = 13;
+    case Cash = 14;
+
+    public function label(): string
+    {
+        return match ($this) {
+            self::Other => 'other',
+            self::Deposit => 'deposit',
+            self::Withdrawal => 'withdrawal',
+            self::Transfer => 'transfer',
+            self::CardPayment => 'card_payment',
+            self::AtmWithdrawal => 'atm_withdrawal',
+            self::Cheque => 'cheque',
+            self::BankFee => 'bank_fee',
+            self::Salary => 'salary',
+            self::Interest => 'interest',
+            self::Refund => 'refund',
+            self::DirectDebit => 'direct_debit',
+            self::StandingOrder => 'standing_order',
+            self::InternationalTransfer => 'international_transfer',
+            self::Cash => 'cash',
+        };
+    }
+
+    public static function fromLabel(?string $label): self
+    {
+        if (blank($label)) {
+            return self::Other;
+        }
+
+        return match (strtolower(trim($label))) {
+            'deposit' => self::Deposit,
+            'withdrawal' => self::Withdrawal,
+            'transfer' => self::Transfer,
+            'card_payment',
+            'card payment' => self::CardPayment,
+            'atm_withdrawal',
+            'atm withdrawal' => self::AtmWithdrawal,
+            'cheque',
+            'check' => self::Cheque,
+            'bank_fee',
+            'bank fee' => self::BankFee,
+            'salary' => self::Salary,
+            'interest' => self::Interest,
+            'refund' => self::Refund,
+            'direct_debit',
+            'direct debit' => self::DirectDebit,
+            'standing_order',
+            'standing order' => self::StandingOrder,
+            'international_transfer',
+            'international transfer' => self::InternationalTransfer,
+            'cash' => self::Cash,
+            'other' => self::Other,
+            default => self::Other,
+        };
+    }
+
+    public static function labels(): array
+    {
+        return array_map(
+            fn (self $case) => $case->label(),
+            self::cases()
+        );
+    }
+
+    public static function promptValues(): string
+    {
+        return implode("\n", array_map(
+            fn (string $label) => "- {$label}",
+            self::labels()
+        ));
+    }
+}
