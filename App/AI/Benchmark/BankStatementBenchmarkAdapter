@@ -1,0 +1,152 @@
+<?php
+
+namespace App\AI\Benchmark;
+
+class BankStatementBenchmarkAdapter
+{
+    public function transform(array $prediction): array
+    {
+        $bank = $prediction['bank_statement'] ?? [];
+
+        return [
+            'document_type' => $prediction['document_type'] ?? null,
+
+            'account' => [
+                'account_name' =>
+                    $bank['account_holder'] ?? null,
+
+                'currency' =>
+                    $bank['currency'] ?? null,
+
+                'iban' =>
+                    $bank['iban'] ?? null,
+
+                'account_number' =>
+                    $bank['account_number'] ?? null,
+
+                /*
+                 * Customer ID is actually available separately
+                 * in the source document.
+                 *
+                 * Do NOT use branch here.
+                 */
+                'customer_id' =>
+                    $bank['customer_id'] ?? null,
+            ],
+
+            'reporting_period' => [
+                'start_date' =>
+                    $this->normalizeDate(
+                        $bank['statement_from'] ?? null
+                    ),
+
+                'end_date' =>
+                    $this->normalizeDate(
+                        $bank['statement_to'] ?? null
+                    ),
+            ],
+
+            'opening_balance' => [
+                'value' =>
+                    $bank['opening_balance'] ?? null,
+            ],
+
+            'transactions' =>
+                $this->transformTransactions(
+                    $bank['transactions'] ?? []
+                ),
+
+            'closing_balance' => [
+                'value' =>
+                    $bank['closing_balance'] ?? null,
+            ],
+        ];
+    }
+
+    private function transformTransactions(
+        array $transactions
+    ): array {
+        $result = [];
+
+        foreach ($transactions as $transaction) {
+            $description =
+                $transaction['description'] ?? null;
+
+            /*
+             * Opening/closing balance rows are not
+             * real transactions.
+             */
+            if (
+                strtoupper(trim((string) $description))
+                === 'OPENING BALANCE'
+            ) {
+                continue;
+            }
+
+            if (
+                strtoupper(trim((string) $description))
+                === 'CLOSING BALANCE'
+            ) {
+                continue;
+            }
+
+            $result[] = [
+                'date' =>
+                    $this->normalizeDate(
+                        $transaction['posting_date'] ?? null
+                    ),
+
+                'description' =>
+                    $description,
+
+                'debit' =>
+                    $transaction['debit'] ?? null,
+
+                'credit' =>
+                    $transaction['credit'] ?? null,
+
+                'balance' =>
+                    $transaction['balance'] ?? null,
+            ];
+        }
+
+        return $result;
+    }
+
+    private function normalizeDate(
+        ?string $date
+    ): ?string {
+        if (
+            $date === null ||
+            trim($date) === ''
+        ) {
+            return null;
+        }
+
+        $date = strtoupper(trim($date));
+
+        $formats = [
+            'dMY',
+            'd-M-Y',
+            'Y-m-d',
+            'd/m/Y',
+            'd/m/y',
+        ];
+
+        foreach ($formats as $format) {
+            $parsed = \DateTime::createFromFormat(
+                $format,
+                $date
+            );
+
+            if (
+                $parsed !== false &&
+                $parsed->format($format) === $date
+            ) {
+                return $parsed->format('Y-m-d');
+            }
+        }
+
+        return null;
+    }
+}
