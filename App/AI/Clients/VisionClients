@@ -1,0 +1,1428 @@
+<?php
+
+namespace App\AI\Clients;
+
+use App\AI\Agents\ExtractionAgent;
+use App\AI\Exceptions\ExtractionException;
+use App\Jobs\ExtractVisionChunkJob;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
+use Laravel\Ai\Files\Document;
+use Laravel\Ai\Files\File;
+use Laravel\Ai\Files\Image;
+
+class VisionClient
+{
+
+
+    /* Main entry point.
+    EXTRACTION_MODE=ocr
+          -> old Mistral OCR implementation
+      EXTRACTION_MODE=vision
+         -> Laravel AI SDK + ExtractionAgent
+    */
+    public function extract(string $path): array
+    {
+        $mode = config('ai.extraction.mode', 'ocr');
+
+        return match ($mode) {
+            'ocr' => $this->extractUsingOcr($path),
+
+            'vision' => $this->extractUsingVision($path),
+
+            default => throw new ExtractionException(
+                "Invalid extraction mode: {$mode}. Expected: ocr or vision."
+            ),
+        };
+    }
+
+    /* OCR
+     Original Mistral OCR path. POST /ocr only.
+     Do not send this result through vision normalization. */
+
+    private function extractUsingOcr(string $path): array
+    {
+        $this->validateFile($path);
+
+        try {
+
+            $response = Http::baseUrl(
+                config('services.mistral.base_url')
+            )
+                ->withToken(
+                    config('services.mistral.key')
+                )
+                ->acceptJson()
+                ->timeout(
+                    config('ai.extraction.timeout', 1800)
+                )
+                ->retry(
+                    config('ai.extraction.retries', 3),
+                    1000,
+                    throw: false
+                )
+                ->post('/ocr', [
+
+                    'model' => 'mistral-ocr-latest',
+
+                    'document' => $this->createDocument($path),
+
+                    'table_format' => 'markdown',
+
+                    'include_image_base64' => false,
+
+                    'include_blocks' => true,
+
+                    'confidence_scores_granularity' => 'page',
+                ]);
+
+            if (!$response->successful()) {
+
+                throw new ExtractionException(
+                    'OCR API error: ' . $response->body()
+                );
+            }
+
+            $payload = $response->json();
+            $usageInfo = $this->normalizeUsageInfo($payload);
+
+            if ($usageInfo !== []) {
+                $payload['usage_info'] = array_merge(
+                    is_array($payload['usage_info'] ?? null) ? $payload['usage_info'] : [],
+                    $usageInfo,
+                    [
+                        'mode' => 'ocr',
+                        'provider' => config('ai.extraction.provider', 'mistral'),
+                    ]
+                );
+            }
+
+            return $payload;
+        } catch (\Throwable $e) {
+
+            if ($e instanceof ExtractionException) {
+                throw $e;
+            }
+
+            throw new ExtractionException(
+                'OCR extraction failed: ' . $e->getMessage(),
+                previous: $e
+            );
+        }
+    }
+
+    /* VISION
+     Vision uses Laravel AI SDK with ExtractionAgent.
+     Large PDFs are processed in page chunks to avoid Mistral 504 timeouts. */
+
+    /* private function extractUsingVision(string $path): array
+    {
+        $this->validateFile($path);
+
+        $mime = mime_content_type($path) ?: 'application/octet-stream';
+
+        try {
+            if ($mime === 'application/pdf') {
+                $pageCount = $this->detectPdfPageCount($path);
+                $chunkSize = max(1, (int) config('ai.extraction.vision_chunk_pages', 8));
+
+                $result = $pageCount <= $chunkSize
+                    ? $this->extractSingleVisionDocument($path)
+                    : $this->extractPdfUsingVisionChunks($path, $pageCount, $chunkSize);
+            } else {
+                $result = $this->extractSingleVisionDocument($path);
+            }
+
+            if (!$this->hasExtractablePages($result)) {
+                return $this->handleEmptyVisionResult($path);
+            }
+
+            $result['model'] = config(
+                'ai.extraction.vision_model',
+                config('ai.extraction.model', 'mistral-large-latest')
+            );
+
+            $result['usage_info'] = array_merge(
+                is_array($result['usage_info'] ?? null) ? $result['usage_info'] : [],
+                [
+                    'mode' => 'vision',
+                    'provider' => 'mistral',
+                    'source' => 'extraction_agent',
+                    'pages' => count($result['pages'] ?? []),
+                ]
+            );
+
+            return $result;
+        } catch (\Throwable $e) {
+            return $this->handleVisionFailure($path, $e);
+        }
+    }
+ */
+    private function extractUsingVision(string $path): array
+    {
+        $this->validateFile($path);
+
+        $mime = mime_content_type($path)
+            ?: 'application/octet-stream';
+
+        try {
+
+        // Non-PDF
+        //Keep images using the current synchronous path.
+       
+
+            if ($mime !== 'application/pdf') {
+
+                $result =
+                    $this->extractSingleVisionDocument(
+                        $path
+                    );
+
+                if (!$this->hasExtractablePages($result)) {
+                    return $this->handleEmptyVisionResult(
+                        $path
+                    );
+                }
+
+                $result['model'] = config(
+                    'ai.extraction.vision_model',
+                    config(
+                        'ai.extraction.model',
+                        'mistral-large-latest'
+                    )
+                );
+
+                $result['usage_info'] = array_merge(
+                    is_array(
+                        $result['usage_info'] ?? null
+                    )
+                        ? $result['usage_info']
+                        : [],
+                    [
+                        'mode' => 'vision',
+                        'provider' => 'mistral',
+                        'source' => 'extraction_agent',
+                        'pages' =>
+                        count($result['pages'] ?? []),
+                    ]
+                );
+
+                return $result;
+            }
+
+        //pdf
+
+            $pageCount =
+                $this->detectPdfPageCount($path);
+
+            $chunkSize = max(
+                1,
+                (int) config(
+                    'ai.extraction.vision_chunk_pages',
+                    8
+                )
+            );
+
+        // Small PDF
+       
+
+            if ($pageCount <= $chunkSize) {
+
+                $result =
+                    $this->extractSingleVisionDocument(
+                        $path
+                    );
+
+                if (!$this->hasExtractablePages($result)) {
+                    return $this->handleEmptyVisionResult(
+                        $path
+                    );
+                }
+
+                $result['model'] = config(
+                    'ai.extraction.vision_model',
+                    config(
+                        'ai.extraction.model',
+                        'mistral-large-latest'
+                    )
+                );
+
+                $result['usage_info'] = array_merge(
+                    is_array(
+                        $result['usage_info'] ?? null
+                    )
+                        ? $result['usage_info']
+                        : [],
+                    [
+                        'mode' => 'vision',
+                        'provider' => 'mistral',
+                        'source' => 'extraction_agent',
+                        'pages' =>
+                        count($result['pages'] ?? []),
+                    ]
+                );
+
+                return $result;
+            }
+
+        //Large PDF -> Parallel Batch
+       
+
+            return $this->extractPdfUsingVisionBatch(
+                $path,
+                $pageCount,
+                $chunkSize
+            );
+        } catch (\Throwable $e) {
+
+            return $this->handleVisionFailure(
+                $path,
+                $e
+            );
+        }
+    }
+    private function extractPdfUsingVisionBatch(
+        string $path,
+        int $pageCount,
+        int $chunkSize
+    ): array {
+
+        $jobs = [];
+
+        $chunkIndex = 1;
+
+    // Build independent jobs
+   
+
+        for (
+            $start = 1;
+            $start <= $pageCount;
+            $start += $chunkSize
+        ) {
+
+            $end =
+                min(
+                    $start + $chunkSize - 1,
+                    $pageCount
+                );
+
+            $jobs[] =
+                new ExtractVisionChunkJob(
+                    path: $path,
+                    startPage: $start,
+                    endPage: $end,
+                    chunkIndex: $chunkIndex
+                );
+
+            $chunkIndex++;
+        }
+
+    // Create batch first so we know its ID
+   
+
+        $batch = Bus::batch([])
+            ->name(
+                'Vision PDF Extraction - '
+                    . basename($path)
+            )
+            ->allowFailures(false)
+            ->dispatch();
+
+        //Add jobs after we have batch ID
+    
+
+        foreach ($jobs as $job) {
+
+            $job->batchId =
+                $batch->id;
+        }
+
+        $batch->add($jobs);
+
+        Log::info(
+            'Vision parallel batch started',
+            [
+                'batch_id' => $batch->id,
+                'file' => basename($path),
+                'pages' => $pageCount,
+                'chunk_size' => $chunkSize,
+                'chunks' => count($jobs),
+                'parallel_limit' =>
+                config(
+                    'ai.extraction.vision_parallel_jobs',
+                    3
+                ),
+            ]
+        );
+
+      //Wait for all chunks
+      //This method is being called from your existing extraction flow, so we wait here until all parallel jobs have completed.
+    
+
+        $timeoutSeconds = max(
+            60,
+            (int) config(
+                'ai.extraction.vision_batch_wait_timeout',
+                1800
+            )
+        );
+
+        $startedAt = microtime(true);
+
+        while (true) {
+
+            $batch =
+                Bus::findBatch(
+                    $batch->id
+                );
+
+            if ($batch === null) {
+
+                throw new \RuntimeException(
+                    'Vision extraction batch could not be found.'
+                );
+            }
+
+            if ($batch->finished()) {
+                break;
+            }
+
+            if ($batch->cancelled()) {
+
+                throw new \RuntimeException(
+                    'Vision extraction batch was cancelled.'
+                );
+            }
+
+            if (
+                microtime(true) - $startedAt
+                >= $timeoutSeconds
+            ) {
+
+                $batch->cancel();
+
+                throw new \RuntimeException(
+                    'Vision extraction batch timed out.'
+                );
+            }
+
+            sleep(1);
+        }
+
+        //Assemble pages
+    
+
+        $allPages = [];
+        $totalUsage = [];
+
+        for (
+            $index = 1;
+            $index <= count($jobs);
+            $index++
+        ) {
+
+            $resultPath =
+                "vision-batches/{$batch->id}/chunk-{$index}.json";
+
+            if (
+                !Storage::disk('local')->exists(
+                    $resultPath
+                )
+            ) {
+
+                throw new \RuntimeException(
+                    "Vision chunk result missing: {$index}"
+                );
+            }
+
+            $json =
+                Storage::disk('local')->get(
+                    $resultPath
+                );
+
+            $result =
+                json_decode(
+                    $json,
+                    true
+                );
+
+            if (
+                !is_array($result)
+            ) {
+
+                throw new \RuntimeException(
+                    "Invalid Vision chunk result: {$index}"
+                );
+            }
+
+            foreach (
+                $result['pages'] ?? []
+                as $page
+            ) {
+
+                if (!is_array($page)) {
+                    continue;
+                }
+
+                $pageIndex =
+                    isset($page['index'])
+                    && is_numeric($page['index'])
+                    ? (int) $page['index']
+                    : null;
+
+                if ($pageIndex === null) {
+                    continue;
+                }
+
+                $allPages[$pageIndex] =
+                    $page;
+            }
+
+            $usage =
+                $result['usage_info']
+                ?? [];
+
+            if (is_array($usage)) {
+
+                $totalUsage =
+                    $this->mergeUsageInfo(
+                        $totalUsage,
+                        $usage
+                    );
+            }
+        }
+
+    //Restore original page order
+   
+
+        ksort($allPages);
+
+        $pages =
+            array_values(
+                $allPages
+            );
+
+        if ($pages === []) {
+
+            return $this->handleEmptyVisionResult(
+                $path
+            );
+        }
+
+      //Cleanup temporary chunk files
+   
+
+        Storage::disk('local')->deleteDirectory(
+            "vision-batches/{$batch->id}"
+        );
+
+
+        return [
+
+            'pages' =>
+            $pages,
+
+            'model' =>
+            config(
+                'ai.extraction.vision_model',
+                config(
+                    'ai.extraction.model',
+                    'mistral-large-latest'
+                )
+            ),
+
+            'usage_info' => array_merge(
+                $totalUsage,
+                [
+                    'mode' => 'vision',
+                    'provider' => 'mistral',
+                    'source' => 'extraction_agent',
+                    'pages' => count($pages),
+                    'chunk_size' => $chunkSize,
+                    'parallel_chunks' =>
+                    count($jobs),
+                    'batch_id' =>
+                    $batch->id,
+                ]
+            ),
+        ];
+    }
+    public function extractVisionPageRangeForJob(
+        string $path,
+        int $startPage,
+        int $endPage
+    ): array {
+
+        return $this->extractVisionPageRange(
+            $path,
+            $startPage,
+            $endPage
+        );
+    }
+
+    /**
+     * Process a PDF in page windows so chat completions do not 504.
+     */
+    /* private function extractPdfUsingVisionChunks(string $path, int $pageCount, int $chunkSize): array
+    {
+        $allPages = [];
+
+        logger()->info('Vision PDF chunked extraction started', [
+            'file' => basename($path),
+            'pages' => $pageCount,
+            'chunk_size' => $chunkSize,
+        ]);
+
+        for ($start = 1; $start <= $pageCount; $start += $chunkSize) {
+            $end = min($start + $chunkSize - 1, $pageCount);
+            $chunk = $this->extractVisionPageRange($path, $start, $end);
+            $returned = 0;
+
+            foreach ($chunk['pages'] ?? [] as $page) {
+                if (!is_array($page)) {
+                    continue;
+                }
+
+                $index = (int) ($page['index'] ?? ($start - 1));
+                $allPages[$index] = $page;
+                $returned++;
+            }
+
+            logger()->info('Vision PDF chunk completed', [
+                'file' => basename($path),
+                'range' => "{$start}-{$end}",
+                'pages_returned' => $returned,
+            ]);
+        }
+
+        ksort($allPages);
+
+        return [
+            'pages' => array_values($allPages),
+            'model' => config(
+                'ai.extraction.vision_model',
+                config('ai.extraction.model', 'mistral-large-latest')
+            ),
+            'usage_info' => [
+                'chunk_size' => $chunkSize,
+                'detected_pages' => $pageCount,
+            ],
+        ];
+    } */
+
+    private function extractSingleVisionDocument(string $path): array
+    {
+        $execution = $this->promptVisionAgent(
+            $path,
+            <<<PROMPT
+Extract this financial document page by page.
+
+Return the OCR-compatible JSON shape from your instructions.
+Include every page, all visible text, and all tables as markdown.
+Do not summarize. Preserve numbers exactly.
+PROMPT
+        );
+
+        $result = $this->normalizeVisionResultToOcrShape(
+            $execution['data']
+        );
+
+        $result['usage_info'] = $execution['usage_info'];
+
+        return $result;
+    }
+
+    private function extractVisionPageRange(string $path, int $startPage, int $endPage): array
+    {
+        $fromIndex = $startPage - 1;
+        $toIndex = $endPage - 1;
+
+        $execution = $this->promptVisionAgent(
+            $path,
+            <<<PROMPT
+Extract ONLY pages {$startPage} through {$endPage} of this financial document (1-based page numbers).
+
+Return OCR-compatible JSON.
+Use absolute 0-based indexes from {$fromIndex} to {$toIndex}.
+Do not extract any other pages.
+Do not summarize. Preserve numbers exactly.
+PROMPT
+        );
+
+        $normalized = $this->normalizeVisionResultToOcrShape(
+            $execution['data']
+        );
+
+        $normalized['usage_info'] = $execution['usage_info'];
+        // Keep only pages that belong to this requested window.
+        $normalized['pages'] = array_values(array_filter(
+            $normalized['pages'] ?? [],
+            function ($page) use ($fromIndex, $toIndex, $startPage) {
+                if (!is_array($page)) {
+                    return false;
+                }
+
+                $index = $page['index'] ?? null;
+
+                if (is_numeric($index)) {
+                    $index = (int) $index;
+
+                    return $index >= $fromIndex && $index <= $toIndex;
+                }
+
+                // If model omitted indexes, assign sequentially from window start.
+                return true;
+            }
+        ));
+
+        // Repair missing/wrong indexes inside the window.
+        if (count($normalized['pages']) > 0) {
+            $repaired = [];
+            $cursor = $fromIndex;
+
+            foreach ($normalized['pages'] as $page) {
+                $index = isset($page['index']) && is_numeric($page['index'])
+                    ? (int) $page['index']
+                    : $cursor;
+
+                if ($index < $fromIndex || $index > $toIndex) {
+                    $index = $cursor;
+                }
+
+                $page['index'] = $index;
+                $repaired[$index] = $page;
+                $cursor = $index + 1;
+            }
+
+            ksort($repaired);
+            $normalized['pages'] = array_values($repaired);
+        }
+
+        return $normalized;
+    }
+
+    private function promptVisionAgent(string $path, string $prompt): array
+    {
+        $maxAttempts = max(1, (int) config('ai.extraction.vision_retries', 1));
+        $lastException = null;
+
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            try {
+                $agent = new ExtractionAgent();
+
+                $response = $agent->prompt(
+                    $prompt,
+                    attachments: [
+                        $this->createVisionAttachment($path),
+                    ],
+                    model: config(
+                        'ai.extraction.vision_model',
+                        config('ai.extraction.model', 'mistral-large-latest')
+                    ),
+                    timeout: (int) config('ai.extraction.vision_timeout', 300),
+                );
+
+                return [
+                    'data' => $this->parseVisionResponse($response),
+                    'usage_info' => $this->extractUsage($response),
+                ];
+            } catch (\Throwable $e) {
+                $lastException = $e;
+                $retryable = $this->isRetryableVisionError($e);
+
+                logger()->warning('Vision agent attempt failed', [
+                    'attempt' => $attempt,
+                    'max_attempts' => $maxAttempts,
+                    'retryable' => $retryable,
+                    'error' => $e->getMessage(),
+                ]);
+
+                if ($retryable && $attempt < $maxAttempts) {
+                    $sleepFor = $this->visionBackoffSeconds($attempt, $e);
+                    logger()->info('Vision agent backoff', [
+                        'attempt' => $attempt,
+                        'sleep' => $sleepFor,
+                    ]);
+                    sleep($sleepFor);
+                    continue;
+                }
+
+                break;
+            }
+        }
+
+        throw new ExtractionException(
+            'Vision extraction failed: ' . ($lastException?->getMessage() ?? 'unknown error'),
+            previous: $lastException
+        );
+    }
+
+    private function detectPdfPageCount(string $path): int
+    {
+        try {
+            $parser = new \Smalot\PdfParser\Parser();
+            $pdf = $parser->parseFile($path);
+            $count = count($pdf->getPages());
+
+            if ($count > 0) {
+                return $count;
+            }
+        } catch (\Throwable $e) {
+            logger()->warning('Could not detect PDF page count via smalot', [
+                'file' => basename($path),
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        // Conservative fallback: keep chunking until a chunk returns no pages.
+        return max(1, (int) config('ai.extraction.vision_assumed_pages', 40));
+    }
+
+    private function handleEmptyVisionResult(string $path): array
+    {
+        if (config('ai.extraction.ocr_fallback', false)) {
+            return $this->extractUsingOcrFallback(
+                $path,
+                'ocr_fallback_after_empty_vision'
+            );
+        }
+
+        throw new ExtractionException(
+            'Vision extraction returned no extractable pages.'
+        );
+    }
+
+    private function handleVisionFailure(string $path, \Throwable $e): array
+    {
+        if (config('ai.extraction.ocr_fallback', false)) {
+            try {
+                return $this->extractUsingOcrFallback(
+                    $path,
+                    'ocr_fallback_after_vision_error',
+                    $e->getMessage()
+                );
+            } catch (\Throwable) {
+                // fall through to original error
+            }
+        }
+
+        if ($e instanceof ExtractionException) {
+            throw $e;
+        }
+
+        throw new ExtractionException(
+            'Vision extraction failed: ' . $e->getMessage(),
+            previous: $e
+        );
+    }
+
+    private function isRetryableVisionError(\Throwable $e): bool
+    {
+        if (
+            $e instanceof \Laravel\Ai\Exceptions\ProviderOverloadedException
+            || $e instanceof \Laravel\Ai\Exceptions\RateLimitedException
+        ) {
+            return true;
+        }
+
+        $message = strtolower($e->getMessage());
+
+        return str_contains($message, 'overloaded')
+            || str_contains($message, 'rate limit')
+            || str_contains($message, 'too many requests')
+            || str_contains($message, 'timeout')
+            || str_contains($message, 'timed out')
+            || str_contains($message, '504')
+            || str_contains($message, '503')
+            || str_contains($message, '429');
+    }
+
+    private function visionBackoffSeconds(int $attempt, \Throwable $e): int
+    {
+        $base = (int) pow(2, $attempt);
+        $message = strtolower($e->getMessage());
+        $isCapacity = $e instanceof \Laravel\Ai\Exceptions\ProviderOverloadedException
+            || $e instanceof \Laravel\Ai\Exceptions\RateLimitedException
+            || str_contains($message, 'overloaded')
+            || str_contains($message, 'rate limit')
+            || str_contains($message, '504')
+            || str_contains($message, '503');
+
+        $wait = $isCapacity ? $base * 2 : $base;
+        $jitter = (int) max(0, round($wait * (random_int(-30, 30) / 100)));
+
+        return max(2, $wait + $jitter);
+    }
+
+    private function extractUsingOcrFallback(
+        string $path,
+        string $source,
+        ?string $visionError = null
+    ): array {
+        $ocr = $this->extractUsingOcr($path);
+
+        $ocr['usage_info'] = array_merge(
+            is_array($ocr['usage_info'] ?? null) ? $ocr['usage_info'] : [],
+            array_filter([
+                'mode' => 'vision_ocr_fallback',
+                'provider' => 'mistral',
+                'vision_model' => config(
+                    'ai.extraction.vision_model',
+                    config('ai.extraction.model', 'mistral-large-latest')
+                ),
+                'source' => $source,
+                'vision_error' => $visionError,
+            ], fn($value) => $value !== null && $value !== '')
+        );
+
+        return $ocr;
+    }
+
+    //Parse free-form or structured agent responses into an array.
+
+    private function parseVisionResponse(mixed $response): array
+    {
+        if (is_array($response)) {
+            return $response;
+        }
+
+        if (is_object($response) && method_exists($response, 'toArray')) {
+            $structured = $response->toArray();
+
+            if (is_array($structured) && $structured !== []) {
+                if (
+                    isset($structured['pages'])
+                    || trim((string) ($structured['text'] ?? '')) !== ''
+                ) {
+                    return $structured;
+                }
+            }
+        }
+
+        if (
+            is_object($response)
+            && isset($response->structured)
+            && is_array($response->structured)
+            && $response->structured !== []
+        ) {
+            return $response->structured;
+        }
+
+        $text = is_object($response) && isset($response->text)
+            ? trim((string) $response->text)
+            : '';
+
+        if ($text === '') {
+            return [];
+        }
+
+        $decoded = $this->decodeJsonPayload($text);
+
+        if (is_array($decoded)) {
+            return $decoded;
+        }
+
+        // Prose fallback — treat as a single page of markdown.
+        return [
+            'pages' => [
+                [
+                    'index' => 0,
+                    'markdown' => $text,
+                    'tables' => [],
+                    'blocks' => [],
+                    'confidence_scores' => [
+                        'average_page_confidence_score' => 0.5,
+                    ],
+                ],
+            ],
+        ];
+    }
+
+    private function decodeJsonPayload(string $text): ?array
+    {
+        $json = trim($text);
+
+        if (str_starts_with($json, '```')) {
+            $json = preg_replace('/^```(?:json)?\s*/i', '', $json) ?? $json;
+            $json = preg_replace('/\s*```$/', '', $json) ?? $json;
+            $json = trim($json);
+        }
+
+        $decoded = json_decode($json, true);
+
+        if (is_array($decoded) && json_last_error() === JSON_ERROR_NONE) {
+            // Agent sometimes nests the OCR payload inside {"text":"{...json...}"}.
+            if (
+                isset($decoded['text'])
+                && is_string($decoded['text'])
+                && !isset($decoded['pages'])
+            ) {
+                $nested = $this->decodeJsonPayload($decoded['text']);
+
+                if (is_array($nested)) {
+                    return $nested;
+                }
+            }
+
+            return $decoded;
+        }
+
+        // Recover truncated/fenced JSON objects when possible.
+        if (
+            preg_match('/\{.*\}/s', $json, $matches) === 1
+        ) {
+            $decoded = json_decode($matches[0], true);
+
+            if (is_array($decoded) && json_last_error() === JSON_ERROR_NONE) {
+                return $decoded;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Force vision agent output into the same shape as Mistral OCR.
+     */
+    private function normalizeVisionResultToOcrShape(array $result): array
+    {
+        if (isset($result['pages']) && is_array($result['pages'])) {
+            $pages = [];
+
+            foreach (array_values($result['pages']) as $index => $page) {
+                if (!is_array($page)) {
+                    continue;
+                }
+
+                $markdown = trim((string) ($page['markdown'] ?? $page['text'] ?? ''));
+                $tables = $this->normalizePageTables($page['tables'] ?? [], $markdown);
+
+                if ($tables === [] && $markdown !== '') {
+                    $tables = $this->extractMarkdownTables($markdown);
+                }
+
+                $blocks = is_array($page['blocks'] ?? null) ? $page['blocks'] : [];
+
+                if ($blocks === []) {
+                    $blocks = $this->buildBlocksFromMarkdown($markdown, $tables);
+                }
+
+                $pages[] = [
+                    'index' => (int) ($page['index'] ?? $index),
+                    'markdown' => $markdown,
+                    'tables' => $tables,
+                    'blocks' => $blocks,
+                    'confidence_scores' => is_array($page['confidence_scores'] ?? null)
+                        ? $page['confidence_scores']
+                        : ['average_page_confidence_score' => 0.8],
+                ];
+            }
+
+            return [
+                'pages' => $pages,
+                'model' => $result['model'] ?? null,
+                'usage_info' => is_array($result['usage_info'] ?? null)
+                    ? $result['usage_info']
+                    : [],
+            ];
+        }
+
+        // Legacy vision shape: {text, tables}
+        $text = trim((string) ($result['text'] ?? ''));
+        $tables = $this->normalizePageTables($result['tables'] ?? [], $text);
+
+        if ($tables === [] && $text !== '') {
+            $tables = $this->extractMarkdownTables($text);
+        }
+
+        if ($text === '' && $tables === []) {
+            return ['pages' => []];
+        }
+
+        return [
+            'pages' => [
+                [
+                    'index' => 0,
+                    'markdown' => $text,
+                    'tables' => $tables,
+                    'blocks' => $this->buildBlocksFromMarkdown($text, $tables),
+                    'confidence_scores' => [
+                        'average_page_confidence_score' => 0.7,
+                    ],
+                ],
+            ],
+            'model' => $result['model'] ?? null,
+            'usage_info' => [],
+        ];
+    }
+
+    /**
+     * @param mixed $rawTables
+     * @return array<int, array{id: string, content: string, format: string}>
+     */
+    private function normalizePageTables(mixed $rawTables, string $markdown): array
+    {
+        $tables = [];
+
+        if (!is_array($rawTables)) {
+            return $tables;
+        }
+
+        foreach ($rawTables as $tableIndex => $table) {
+            if (is_string($table) && trim($table) !== '') {
+                $tables[] = [
+                    'id' => 'tbl-' . $tableIndex . '.md',
+                    'content' => trim($table),
+                    'format' => 'markdown',
+                ];
+                continue;
+            }
+
+            if (!is_array($table)) {
+                continue;
+            }
+
+            $content = $table['content'] ?? $table['markdown'] ?? null;
+
+            if (!is_string($content) || trim($content) === '') {
+                continue;
+            }
+
+            $tables[] = [
+                'id' => $table['id'] ?? ('tbl-' . $tableIndex . '.md'),
+                'content' => trim($content),
+                'format' => $table['format'] ?? 'markdown',
+            ];
+        }
+
+        return $tables;
+    }
+
+    /**
+     * @return array<int, array{id: string, content: string, format: string}>
+     */
+    private function extractMarkdownTables(string $markdown): array
+    {
+        $tables = [];
+        $buffer = [];
+
+        $flush = function () use (&$buffer, &$tables): void {
+            if (count($buffer) < 2) {
+                $buffer = [];
+                return;
+            }
+
+            $hasSeparator = false;
+
+            foreach ($buffer as $line) {
+                if (preg_match('/^\|?\s*:?-{3,}/', $line) === 1) {
+                    $hasSeparator = true;
+                    break;
+                }
+            }
+
+            if ($hasSeparator) {
+                $tables[] = [
+                    'id' => 'tbl-' . count($tables) . '.md',
+                    'content' => implode("\n", $buffer),
+                    'format' => 'markdown',
+                ];
+            }
+
+            $buffer = [];
+        };
+
+        foreach (preg_split('/\R/', $markdown) as $line) {
+            if (str_starts_with(trim($line), '|')) {
+                $buffer[] = rtrim($line);
+                continue;
+            }
+
+            $flush();
+        }
+
+        $flush();
+
+        return $tables;
+    }
+
+    /**
+     * Vision models do not return OCR bounding boxes. Build OCR-shaped blocks
+     * from markdown and tables so downstream code still has tables/blocks.
+     *
+     * @param array<int, array{id: string, content: string, format: string}> $tables
+     * @return array<int, array<string, mixed>>
+     */
+    private function buildBlocksFromMarkdown(string $markdown, array $tables): array
+    {
+        $blocks = [];
+        $remaining = $markdown;
+
+        foreach ($tables as $table) {
+            $content = $table['content'];
+            $position = $content === '' ? false : strpos($remaining, $content);
+
+            if ($position === false) {
+                $blocks[] = $this->visionBlock($content, 'table', $table['id']);
+                continue;
+            }
+
+            $before = trim(substr($remaining, 0, $position));
+
+            if ($before !== '') {
+                $blocks[] = $this->visionBlock($before, 'text');
+            }
+
+            $blocks[] = $this->visionBlock($content, 'table', $table['id']);
+            $remaining = substr($remaining, $position + strlen($content));
+        }
+
+        $after = trim($remaining);
+
+        if ($after !== '') {
+            $blocks[] = $this->visionBlock($after, 'text');
+        }
+
+        return $blocks;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function visionBlock(string $content, string $type, ?string $tableId = null): array
+    {
+        $block = [
+            'top_left_x' => null,
+            'top_left_y' => null,
+            'bottom_right_x' => null,
+            'bottom_right_y' => null,
+            'content' => $content,
+            'confidence_scores' => null,
+            'type' => $type,
+        ];
+
+        if ($tableId !== null) {
+            $block['table_id'] = $tableId;
+        }
+
+        return $block;
+    }
+
+    private function hasExtractablePages(array $result): bool
+    {
+        if (!isset($result['pages']) || !is_array($result['pages']) || $result['pages'] === []) {
+            return false;
+        }
+
+        foreach ($result['pages'] as $page) {
+            if (!is_array($page)) {
+                continue;
+            }
+
+            if (trim((string) ($page['markdown'] ?? '')) !== '') {
+                return true;
+            }
+
+            if (!empty($page['tables'])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+    private function extractUsage(mixed $response): array
+    {
+        if (is_object($response) && isset($response->usage)) {
+            $usage = $response->usage;
+
+            if (is_object($usage) && method_exists($usage, 'toArray')) {
+                $usage = $usage->toArray();
+            }
+
+            if (is_array($usage)) {
+                return $this->normalizeUsageInfo([
+                    'usage' => $usage,
+                ]);
+            }
+        }
+
+        if (is_array($response)) {
+            return $this->normalizeUsageInfo($response);
+        }
+
+        return [];
+    }
+
+    private function normalizeUsageInfo(array $payload): array
+    {
+        $usage = $payload['usage_info'] ?? $payload['usage'] ?? [];
+
+        if (is_object($usage) && method_exists($usage, 'toArray')) {
+            $usage = $usage->toArray();
+        }
+
+        if (!is_array($usage)) {
+            return [];
+        }
+
+        $normalized = [];
+
+        foreach (
+            [
+                'input_tokens',
+                'prompt_tokens',
+                'promptTokens',
+                'output_tokens',
+                'completion_tokens',
+                'completionTokens',
+                'total_tokens',
+                'totalTokens',
+                'cost',
+                'total_cost',
+                'totalCost',
+            ] as $key
+        ) {
+            if (array_key_exists($key, $usage) && $usage[$key] !== null) {
+                $normalized[$key] = $usage[$key];
+            }
+        }
+
+        if (!isset($normalized['total_tokens']) && !isset($normalized['totalTokens'])) {
+            $input = $normalized['input_tokens'] ?? $normalized['prompt_tokens'] ?? $normalized['promptTokens'] ?? null;
+            $output = $normalized['output_tokens'] ?? $normalized['completion_tokens'] ?? $normalized['completionTokens'] ?? null;
+
+            if ($input !== null || $output !== null) {
+                $normalized['total_tokens'] = (int) (($input ?? 0) + ($output ?? 0));
+            }
+        }
+
+        return $normalized;
+    }
+    private function mergeUsageInfo(
+        array $base,
+        array $incoming
+    ): array {
+        foreach (
+            [
+                'input_tokens',
+                'output_tokens',
+                'reasoning_tokens',
+                'total_tokens',
+                'cost',
+            ] as $key
+        ) {
+            if (
+                !array_key_exists($key, $incoming)
+                ||
+                $incoming[$key] === null
+            ) {
+                continue;
+            }
+
+            if (
+                !array_key_exists($key, $base)
+                ||
+                $base[$key] === null
+            ) {
+                $base[$key] = $incoming[$key];
+
+                continue;
+            }
+
+            if (
+                is_numeric($base[$key])
+                &&
+                is_numeric($incoming[$key])
+            ) {
+                $base[$key] =
+                    (float) $base[$key]
+                    +
+                    (float) $incoming[$key];
+            }
+        }
+
+        return $base;
+    }
+
+    private function createVisionAttachment(string $path): File
+    {
+        $mime = mime_content_type($path) ?: 'application/octet-stream';
+
+        return match (true) {
+            str_starts_with($mime, 'image/') => Image::fromPath($path, $mime),
+
+            $mime === 'application/pdf' => Document::fromUrl(
+                'data:application/pdf;base64,' . base64_encode(
+                    file_get_contents($path)
+                )
+            )->as(basename($path)),
+
+            default => throw new ExtractionException(
+                "Unsupported mime type for vision extraction: {$mime}"
+            ),
+        };
+    }
+
+    private function createDocument(string $path): array
+    {
+        $mime = mime_content_type($path);
+
+        $base64 = base64_encode(
+            file_get_contents($path)
+        );
+
+        return match ($mime) {
+            'application/pdf' => [
+                'type' => 'document_url',
+                'document_url' => "data:application/pdf;base64,{$base64}",
+            ],
+            'image/png',
+            'image/jpeg',
+            'image/webp' => [
+                'type' => 'image_url',
+                'image_url' => "data:{$mime};base64,{$base64}",
+            ],
+            default => throw new ExtractionException(
+                "Unsupported mime type: {$mime}"
+            ),
+        };
+    }
+
+    private function validateFile(string $path): void
+    {
+        if (!file_exists($path)) {
+            throw new ExtractionException("File not found: {$path}");
+        }
+
+        if (!is_readable($path)) {
+            throw new ExtractionException("File is not readable: {$path}");
+        }
+    }
+
+    public function getMode(): string
+    {
+        return config('ai.extraction.mode', 'ocr');
+    }
+
+    public function getProvider(): string
+    {
+        return config('ai.extraction.provider', 'mistral');
+    }
+
+    public function getModel(): string
+    {
+        if ($this->getMode() === 'vision') {
+            return config(
+                'ai.extraction.vision_model',
+                config('ai.extraction.model', 'mistral-large-latest')
+            );
+        }
+
+        return config(
+            'ai.extraction.ocr_model',
+            config('ai.extraction.model', 'mistral-ocr-latest')
+        );
+    }
+}
