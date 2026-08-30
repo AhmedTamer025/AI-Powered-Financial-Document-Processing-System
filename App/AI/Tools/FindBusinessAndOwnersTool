@@ -1,0 +1,111 @@
+<?php
+
+namespace App\AI\Tools;
+
+use App\Models\Business;
+use Illuminate\Contracts\JsonSchema\JsonSchema;
+use Laravel\Ai\Contracts\Tool;
+use Laravel\Ai\Tools\Request;
+use Stringable;
+
+class FindBusinessAndOwnersTool implements Tool
+{
+    public function __construct(
+        private readonly string $businessId
+    ) {}
+
+    public function description(): Stringable|string
+    {
+        return <<<TEXT
+Look up the selected business and its registered owners.
+
+The business ID is fixed by the application.
+
+Use this tool when you need to verify whether a business,
+company, or bank account-holder name found in the document
+belongs to the selected business.
+
+The tool returns only the business and owners belonging to
+the current business ID.
+
+Never try to change or provide another business ID.
+TEXT;
+    }
+
+    public function schema(JsonSchema $schema): array
+    {
+        /*
+         * No business_id parameter.
+         *
+         * The business ID comes from application code.
+         */
+        return [];
+    }
+
+    public function handle(Request $request): Stringable|string
+    {
+        logger()->info(
+            'Business owner lookup tool called',
+            [
+                'business_id' => $this->businessId,
+            ]
+        );
+
+        $business = Business::query()
+            ->select([
+                'id',
+                'name',
+            ])
+            ->with([
+                'owners:id,business_id,name',
+            ])
+            ->find($this->businessId);
+
+        if (! $business) {
+
+            logger()->warning(
+                'Business owner lookup: business not found',
+                [
+                    'business_id' => $this->businessId,
+                ]
+            );
+
+            return json_encode([
+                'found' => false,
+                'business' => null,
+                'owners' => [],
+            ], JSON_UNESCAPED_UNICODE);
+        }
+
+        $result = [
+            'found' => true,
+
+            'business' => [
+                'id' => $business->id,
+                'name' => $business->name,
+            ],
+
+            'owners' => $business->owners
+                ->map(fn($owner) => [
+                    'id' => $owner->id,
+                    'name' => $owner->name,
+                ])
+                ->values()
+                ->all(),
+        ];
+
+        logger()->info(
+            'Business owner lookup result',
+            [
+                'business_id' => $this->businessId,
+                'business_name' => $business->name,
+                'owner_count' => count($result['owners']),
+            ]
+        );
+
+        return json_encode(
+            $result,
+            JSON_UNESCAPED_UNICODE
+        );
+    }
+}
