@@ -1,0 +1,319 @@
+<?php
+
+namespace App\Console\Commands;
+
+use App\AI\Benchmark\ModelBenchmarkRunner;
+use Illuminate\Console\Command;
+use Throwable;
+
+class BenchmarkCommand extends Command
+{
+    protected $signature = 'benchmark:run
+                            {dataset : Benchmark dataset ID}
+                            {--model=* : Models to benchmark (mistral, gemini)}
+                            {--json : Return results as JSON}';
+
+    protected $description = 'Run AI model benchmark against a benchmark dataset';
+
+    public function __construct(
+        protected ModelBenchmarkRunner $runner
+    ) {
+        parent::__construct();
+    }
+
+    public function handle(): int
+    {
+        $datasetId = $this->argument('dataset');
+
+        /*
+         * If no --model option is provided,
+         * benchmark both models.
+         */
+        $models = $this->option('model');
+
+        if (empty($models)) {
+            $models = [
+                'mistral',
+                'gemini',
+            ];
+        }
+
+        /*
+         * Remove duplicates.
+         */
+        $models = array_values(
+            array_unique($models)
+        );
+
+        /*
+         * Validate models.
+         */
+        $supportedModels = [
+            'mistral',
+            'gemini',
+        ];
+
+        foreach ($models as $model) {
+            if (!in_array($model, $supportedModels, true)) {
+                $this->error(
+                    "Unsupported model [{$model}]."
+                );
+
+                $this->line(
+                    'Supported models: mistral, gemini'
+                );
+
+                return self::FAILURE;
+            }
+        }
+
+        $this->info(
+            "Loading benchmark dataset: {$datasetId}"
+        );
+
+        $this->newLine();
+
+        $this->info(
+            'Models: ' . implode(', ', $models)
+        );
+
+        $this->newLine();
+
+        try {
+            $results = $this->runner->run(
+                $datasetId,
+                $models
+            );
+
+            if (empty($results)) {
+                $this->warn(
+                    'Benchmark completed but no results were generated.'
+                );
+
+                return self::SUCCESS;
+            }
+
+            if ($this->option('json')) {
+                $this->line(
+                    json_encode(
+                        $this->formatJsonResults($results),
+                        JSON_PRETTY_PRINT |
+                        JSON_UNESCAPED_UNICODE |
+                        JSON_UNESCAPED_SLASHES
+                    )
+                );
+
+                return self::SUCCESS;
+            }
+
+            $this->displayResults($results);
+
+            $this->newLine();
+
+            $this->info(
+                'Benchmark completed successfully.'
+            );
+
+            return self::SUCCESS;
+        } catch (Throwable $e) {
+            $this->newLine();
+
+            $this->error(
+                'Benchmark failed.'
+            );
+
+            $this->error(
+                $e->getMessage()
+            );
+
+            if ($this->getOutput()->isVerbose()) {
+                $this->newLine();
+
+                $this->line(
+                    $e->getTraceAsString()
+                );
+            }
+
+            return self::FAILURE;
+        }
+    }
+
+    protected function displayResults(
+        array $results
+    ): void {
+        $rows = [];
+
+        foreach ($results as $result) {
+            $rows[] = [
+                'model' =>
+                    $result->run?->model
+                    ?? 'unknown',
+
+                'file' =>
+                    $result->file?->filename
+                    ?? 'unknown',
+
+                'status' =>
+                    $result->status
+                    ?? 'unknown',
+
+                'accuracy' =>
+                    $this->formatAccuracy(
+                        $result->accuracy
+                    ),
+
+                'correct' =>
+                    $result->correct_fields
+                    ?? 0,
+
+                'incorrect' =>
+                    $result->incorrect_fields
+                    ?? 0,
+
+                'missing' =>
+                    $result->missing_fields
+                    ?? 0,
+
+                'time' =>
+                    $this->formatProcessingTime(
+                        $result->processing_time_ms
+                    ),
+
+                'tokens' =>
+                    $result->total_tokens
+                    ?? '-',
+
+                'cost' =>
+                    $this->formatCost(
+                        $result->cost
+                    ),
+            ];
+        }
+
+        $this->table(
+            [
+                'Model',
+                'File',
+                'Status',
+                'Accuracy',
+                'Correct',
+                'Incorrect',
+                'Missing',
+                'Time',
+                'Tokens',
+                'Cost',
+            ],
+            $rows
+        );
+    }
+
+    protected function formatAccuracy(
+        mixed $accuracy
+    ): string {
+        if ($accuracy === null) {
+            return '-';
+        }
+
+        return number_format(
+            (float) $accuracy * 100,
+            2
+        ) . '%';
+    }
+
+    protected function formatProcessingTime(
+        mixed $milliseconds
+    ): string {
+        if ($milliseconds === null) {
+            return '-';
+        }
+
+        $milliseconds = (int) $milliseconds;
+
+        if ($milliseconds < 1000) {
+            return $milliseconds . ' ms';
+        }
+
+        return number_format(
+            $milliseconds / 1000,
+            2
+        ) . ' s';
+    }
+
+    protected function formatCost(
+        mixed $cost
+    ): string {
+        if ($cost === null) {
+            return '-';
+        }
+
+        return number_format(
+            (float) $cost,
+            6
+        );
+    }
+
+    protected function formatJsonResults(
+        array $results
+    ): array {
+        return array_map(
+            function ($result) {
+                return [
+                    'id' =>
+                        $result->id,
+
+                    'benchmark_run_id' =>
+                        $result->benchmark_run_id,
+
+                    'benchmark_dataset_file_id' =>
+                        $result->benchmark_dataset_file_id,
+
+                    'model' =>
+                        $result->run?->model,
+
+                    'provider' =>
+                        $result->run?->provider,
+
+                    'filename' =>
+                        $result->file?->filename,
+
+                    'status' =>
+                        $result->status,
+
+                    'accuracy' =>
+                        $result->accuracy,
+
+                    'correct_fields' =>
+                        $result->correct_fields,
+
+                    'incorrect_fields' =>
+                        $result->incorrect_fields,
+
+                    'missing_fields' =>
+                        $result->missing_fields,
+
+                    'extra_fields' =>
+                        $result->extra_fields,
+
+                    'processing_time_ms' =>
+                        $result->processing_time_ms,
+
+                    'input_tokens' =>
+                        $result->input_tokens,
+
+                    'output_tokens' =>
+                        $result->output_tokens,
+
+                    'total_tokens' =>
+                        $result->total_tokens,
+
+                    'cost' =>
+                        $result->cost,
+
+                    'error' =>
+                        $result->error,
+                ];
+            },
+            $results
+        );
+    }
+}
